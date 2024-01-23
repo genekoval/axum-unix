@@ -1,0 +1,16 @@
+[package]
+name = "axum-unix"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+futures-util = "0.3"
+hyper = "1"
+hyper-util = "0.1"
+libc = "0.2"
+log = "0.4"
+nix = { version = "0.27", features = ["user"] }
+serde = { version = "1", optional = true, default-features = false }
+tokio = { version = "1", features = ["signal"] }
+tower = "0.4"
