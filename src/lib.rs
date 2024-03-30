@@ -1,7 +1,9 @@
 mod endpoint;
 mod serde;
+mod signal;
 
 pub use endpoint::{Endpoint, UnixDomainSocket};
+pub use signal::shutdown_signal;
 
 use axum::{extract::Request, Router};
 use futures_util::{pin_mut, FutureExt};
@@ -12,101 +14,55 @@ use hyper_util::{
 };
 use log::{error, info, log_enabled, trace, warn, Level::Trace};
 use std::net::SocketAddr;
-use std::{ffi::CStr, fmt::Display, os::raw::c_int, sync::Arc};
+use std::path::PathBuf;
 use tokio::{
-    io::AsyncRead, io::AsyncWrite, net, signal::unix::SignalKind, sync::watch,
+    net::{unix, TcpListener, UnixListener},
+    task::JoinHandle,
 };
+use tokio_util::{net::Listener, sync::CancellationToken, task::TaskTracker};
 use tower::Service;
 
-trait Listener {
-    async fn accept(
-        &self,
-    ) -> std::io::Result<(
-        impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-        Option<SocketAddr>,
-    )>;
-}
+struct PathGuard(PathBuf);
 
-struct TcpListener(net::TcpListener);
-
-impl TcpListener {
-    async fn bind(addr: &str) -> Result<Self, String> {
-        let inner = net::TcpListener::bind(addr).await.map_err(|err| {
-            format!("Failed to bind to address '{addr}': {err}")
-        })?;
-
-        Ok(Self(inner))
-    }
-}
-
-impl Listener for TcpListener {
-    async fn accept(
-        &self,
-    ) -> std::io::Result<(
-        impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-        Option<SocketAddr>,
-    )> {
-        self.0
-            .accept()
-            .await
-            .map(|(socket, remote)| (socket, Some(remote)))
-    }
-}
-
-struct UnixListener<'a> {
-    inner: net::UnixListener,
-    socket: &'a UnixDomainSocket,
-}
-
-impl<'a> UnixListener<'a> {
-    fn bind(socket: &'a UnixDomainSocket) -> Result<Self, String> {
-        let path = socket.path.as_path();
-        let inner = net::UnixListener::bind(path).map_err(|err| {
-            format!(
-                "Failed to bind Unix domain socket path '{}': {err}",
-                path.display()
-            )
-        })?;
-
-        // Construct Self before setting permissions so that its
-        // Drop implementation executes even if setting permissions fails.
-        let result = Self { inner, socket };
-        socket.set_permissions()?;
-
-        Ok(result)
-    }
-}
-
-impl<'a> Listener for UnixListener<'a> {
-    async fn accept(
-        &self,
-    ) -> std::io::Result<(
-        impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-        Option<SocketAddr>,
-    )> {
-        self.inner.accept().await.map(|(socket, _)| (socket, None))
-    }
-}
-
-impl<'a> Drop for UnixListener<'a> {
+impl Drop for PathGuard {
     fn drop(&mut self) {
-        self.socket.remove_file();
+        let path = self.0.as_path();
+
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                trace!("Removed Unix domain socket file '{}'", path.display())
+            }
+            Err(err) => warn!(
+                "Failed to remove Unix domain socket file '{}': {err}",
+                path.display()
+            ),
+        }
     }
 }
 
-async fn listen<T>(listener: T, app: Router)
+trait DisplayAddr {
+    fn addr_string(&self) -> Option<String>;
+}
+
+impl DisplayAddr for std::net::SocketAddr {
+    fn addr_string(&self) -> Option<String> {
+        Some(self.to_string())
+    }
+}
+
+impl DisplayAddr for unix::SocketAddr {
+    fn addr_string(&self) -> Option<String> {
+        None
+    }
+}
+
+async fn listen<T>(mut listener: T, app: Router, token: CancellationToken)
 where
     T: Listener,
+    T::Addr: DisplayAddr,
+    T::Io: Send + Unpin + 'static,
 {
-    let signal = shutdown_signal();
-    let (signal_tx, signal_rx) = watch::channel(());
-    let signal_tx = Arc::new(signal_tx);
-    tokio::spawn(async move {
-        signal.await;
-        drop(signal_rx);
-    });
-
-    let (tasks_tx, tasks_rx) = watch::channel(());
+    let tracker = TaskTracker::new();
 
     loop {
         let (socket, remote) = tokio::select! {
@@ -119,24 +75,22 @@ where
                     }
                 }
             },
-            _ = signal_tx.closed() => {
+            _ = token.cancelled() => {
                 trace!("Signal received, not accepting new connections");
                 break;
             }
         };
 
-        match remote {
+        match remote.addr_string() {
             Some(addr) => trace!("Connection accepted from {addr}"),
             None => trace!("Connection accepted"),
         };
 
         let socket = TokioIo::new(socket);
         let tower_service = app.clone();
+        let cloned_token = token.clone();
 
-        let signal_tx = Arc::clone(&signal_tx);
-        let tasks_rx = tasks_rx.clone();
-
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let hyper_service =
                 service_fn(move |request: Request<Incoming>| {
                     tower_service.clone().call(request)
@@ -147,8 +101,8 @@ where
                 builder.serve_connection_with_upgrades(socket, hyper_service);
             pin_mut!(connection);
 
-            let signal_closed = signal_tx.closed().fuse();
-            pin_mut!(signal_closed);
+            let cancellation = cloned_token.cancelled().fuse();
+            pin_mut!(cancellation);
 
             loop {
                 tokio::select! {
@@ -158,9 +112,9 @@ where
                         }
                         break;
                     }
-                    _ = &mut signal_closed => {
+                    _ = &mut cancellation => {
                         trace!(
-                            "Signal received in task, \
+                            "Cancellation requested for connection task, \
                             starting graceful shutdown"
                         );
                         connection.as_mut().graceful_shutdown();
@@ -169,15 +123,13 @@ where
             }
 
             trace!("Connection closed");
-            drop(tasks_rx);
         });
     }
 
-    drop(tasks_rx);
     drop(listener);
 
     if log_enabled!(Trace) {
-        let tasks = tasks_tx.receiver_count();
+        let tasks = tracker.len();
 
         if tasks > 0 {
             trace!(
@@ -190,16 +142,24 @@ where
         }
     }
 
-    tasks_tx.closed().await;
+    tracker.close();
+    tracker.wait().await;
 }
 
-async fn serve_inet<F>(addr: &str, app: Router, f: F) -> Result<(), String>
+async fn serve_inet<F>(
+    addr: &str,
+    app: Router,
+    token: CancellationToken,
+    f: F,
+) -> Result<JoinHandle<()>, String>
 where
     F: FnOnce(Option<SocketAddr>),
 {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|err| format!("failed to bind to address '{addr}': {err}"))?;
 
-    match listener.0.local_addr() {
+    match listener.local_addr() {
         Ok(addr) => {
             info!("Listening for connections on {addr}");
             f(Some(addr));
@@ -211,76 +171,55 @@ where
         }
     };
 
-    listen(listener, app).await;
+    let handle = tokio::spawn(async move {
+        listen(listener, app, token).await;
+    });
 
-    Ok(())
+    Ok(handle)
 }
 
 async fn serve_unix<F>(
     uds: &UnixDomainSocket,
     app: Router,
+    token: CancellationToken,
     f: F,
-) -> Result<(), String>
+) -> Result<JoinHandle<()>, String>
 where
     F: FnOnce(Option<SocketAddr>),
 {
-    let listener = UnixListener::bind(uds)?;
+    let path = uds.path.as_path();
+    let listener = UnixListener::bind(path).map_err(|err| {
+        format!(
+            "failed to bind to Unix domain socket path '{}': {err}",
+            path.display()
+        )
+    })?;
+    let guard = PathGuard(path.to_path_buf());
 
-    info!("Listening for connections on \"{}\"", uds.path.display());
+    uds.set_permissions()?;
+
+    info!("Listening for connections on \"{}\"", path.display());
     f(None);
 
-    listen(listener, app).await;
+    let handle = tokio::spawn(async move {
+        listen(listener, app, token).await;
+        drop(guard);
+    });
 
-    Ok(())
+    Ok(handle)
 }
 
 pub async fn serve<F>(
     endpoint: &Endpoint,
     app: Router,
+    token: CancellationToken,
     f: F,
-) -> Result<(), String>
+) -> Result<JoinHandle<()>, String>
 where
     F: FnOnce(Option<SocketAddr>),
 {
     match endpoint {
-        Endpoint::Inet(inet) => serve_inet(inet, app, f).await,
-        Endpoint::Unix(unix) => serve_unix(unix, app, f).await,
+        Endpoint::Inet(inet) => serve_inet(inet, app, token, f).await,
+        Endpoint::Unix(unix) => serve_unix(unix, app, token, f).await,
     }
-}
-
-struct Signal(c_int);
-
-impl Display for Signal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "signal ({})", self.0)?;
-
-        unsafe {
-            let ptr = libc::strsignal(self.0);
-
-            if ptr.is_null() {
-                Ok(())
-            } else {
-                let string = CStr::from_ptr(ptr).to_str().unwrap();
-                write!(f, ": {string}")
-            }
-        }
-    }
-}
-
-async fn wait_for_signal(signal: SignalKind) -> Signal {
-    tokio::signal::unix::signal(signal)
-        .expect("Failed to install signal handler")
-        .recv()
-        .await;
-
-    Signal(signal.as_raw_value())
-}
-
-async fn shutdown_signal() {
-    let signal = tokio::select! {
-        signal = wait_for_signal(SignalKind::interrupt()) => signal,
-        signal = wait_for_signal(SignalKind::terminate()) => signal,
-    };
-
-    info!("Received {signal}");
 }

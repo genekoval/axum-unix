@@ -1,4 +1,3 @@
-use log::{trace, warn};
 use nix::unistd;
 use std::{
     fs::{set_permissions, Permissions},
@@ -83,20 +82,6 @@ impl UnixDomainSocket {
                 self.path.display()
             )
         })
-    }
-
-    pub(crate) fn remove_file(&self) {
-        let path = self.path.as_path();
-
-        match std::fs::remove_file(path) {
-            Ok(()) => {
-                trace!("Removed Unix domain socket file '{}'", path.display())
-            }
-            Err(err) => warn!(
-                "Failed to remove Unix domain socket file '{}': {err}",
-                path.display()
-            ),
-        }
     }
 
     pub(crate) fn set_permissions(&self) -> Result {
