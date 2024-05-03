@@ -1,12 +1,14 @@
 #![cfg(feature = "serde")]
 
-use crate::{Endpoint, UnixDomainSocket};
+use crate::Endpoint;
 
 use serde::{
-    de::{Deserialize, Error, MapAccess, Visitor},
+    de::{
+        value::MapAccessDeserializer, Deserialize, Error, MapAccess, Visitor,
+    },
     ser::{Serialize, SerializeMap, Serializer},
 };
-use std::{fmt, path::PathBuf};
+use std::fmt;
 
 impl Serialize for Endpoint {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -56,59 +58,24 @@ impl<'de> Deserialize<'de> for Endpoint {
             type Value = Endpoint;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(
-                    formatter,
-                    "a path or map of options for a Unix domain socket"
-                )
+                formatter.write_str("a string or map")
             }
 
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
             where
                 M: MapAccess<'de>,
             {
-                let mut uds = UnixDomainSocket::default();
+                let deserializer = MapAccessDeserializer::new(map);
+                let uds = Deserialize::deserialize(deserializer)?;
 
-                while let Some((key, value)) = map.next_entry::<&str, &str>()? {
-                    match key {
-                        "path" => uds.path = PathBuf::from(value),
-                        "mode" => {
-                            uds.mode = Some(
-                                u32::from_str_radix(value, 8)
-                                    .map_err(Error::custom)?,
-                            )
-                        }
-                        "owner" => {
-                            uds.owner =
-                                Some(value.parse().map_err(Error::custom)?)
-                        }
-                        "group" => {
-                            uds.group =
-                                Some(value.parse().map_err(Error::custom)?)
-                        }
-                        _ => {
-                            return Err(Error::unknown_field(
-                                key,
-                                &["path", "mode", "owner", "group"],
-                            ))
-                        }
-                    }
-                }
-
-                Ok(Endpoint::Unix(uds))
+                Ok(Self::Value::Unix(uds))
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
             where
                 E: Error,
             {
-                if value.starts_with('/') {
-                    Ok(Endpoint::Unix(UnixDomainSocket {
-                        path: PathBuf::from(value),
-                        ..Default::default()
-                    }))
-                } else {
-                    Ok(Endpoint::Inet(value.into()))
-                }
+                Ok(value.parse().unwrap())
             }
         }
 

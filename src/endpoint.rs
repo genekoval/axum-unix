@@ -1,11 +1,16 @@
 use nix::unistd;
+#[cfg(feature = "serde")]
+use serde::Deserialize;
 use std::{
+    convert::Infallible,
     fs::{set_permissions, Permissions},
     os::unix::fs::{self, PermissionsExt},
     path::PathBuf,
+    result,
+    str::FromStr,
 };
 
-type Result = std::result::Result<(), String>;
+type Result = result::Result<(), String>;
 
 #[derive(Debug)]
 pub enum Endpoint {
@@ -13,7 +18,20 @@ pub enum Endpoint {
     Unix(UnixDomainSocket),
 }
 
+impl FromStr for Endpoint {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        if s.starts_with('/') {
+            Ok(Self::Unix(s.parse().unwrap()))
+        } else {
+            Ok(Self::Inet(s.to_string()))
+        }
+    }
+}
+
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Deserialize))]
 pub struct UnixDomainSocket {
     pub path: PathBuf,
     pub mode: Option<u32>,
@@ -89,5 +107,16 @@ impl UnixDomainSocket {
         self.chmod()?;
 
         Ok(())
+    }
+}
+
+impl FromStr for UnixDomainSocket {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        Ok(Self {
+            path: PathBuf::from(s),
+            ..Default::default()
+        })
     }
 }
